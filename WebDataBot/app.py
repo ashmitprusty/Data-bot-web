@@ -9,18 +9,18 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from werkzeug.utils import secure_filename
 import tempfile
 
-# New imports for new file formats
 from docx import Document
 from fpdf import FPDF
 import matplotlib
-matplotlib.use('Agg') # Required for server-side image generation
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-API_KEY = 'helloworld' # Replace with your OCR.space API key
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'csv', 'xlsx', 'xls', 'json', 'txt'}
+API_KEY = 'helloworld' 
+# ADDED .docx TO ALLOWED EXTENSIONS
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'csv', 'xlsx', 'xls', 'json', 'txt', 'docx'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -36,6 +36,19 @@ def process_file(filepath, filename):
             df = pd.read_csv(filepath, header=None, on_bad_lines='skip', sep=None, engine='python')
         elif ext == 'json':
             df = pd.read_json(filepath)
+            
+        # --- NEW: WORD DOCUMENT UPLOAD SUPPORT ---
+        elif ext == 'docx':
+            doc = Document(filepath)
+            data = []
+            for table in doc.tables:
+                for row in table.rows:
+                    data.append([cell.text.strip() for cell in row.cells])
+            if data:
+                df = pd.DataFrame(data)
+            else:
+                return None, "No tables found in the Word document."
+                
         elif ext in ['png', 'jpg', 'jpeg', 'pdf']:
             url = "https://api.ocr.space/parse/image"
             payload = {'apikey': API_KEY, 'isTable': True, 'scale': True}
@@ -65,7 +78,6 @@ def process_file(filepath, filename):
             df.reset_index(drop=True, inplace=True)
             df.columns = [str(col).strip().upper() for col in df.columns]
             df = df.fillna("") 
-            # Scrub illegal invisible XML characters (prevents Excel crashes)
             df = df.replace({r'[\x00-\x08\x0b-\x0c\x0e-\x1f]': ''}, regex=True)
             return df, None
             
@@ -107,7 +119,6 @@ def upload_file():
 
 @app.route('/export', methods=['POST'])
 def export_data():
-    """ Handles exporting to ALL formats (Excel, CSV, JSON, TXT, DOCX, PDF, Image) """
     data = request.json.get('data')
     format_type = request.json.get('format')
     df = pd.DataFrame(data)
@@ -156,12 +167,17 @@ def export_data():
         pdf.add_page()
         pdf.set_font("Arial", size=9)
         col_width = 190 / (len(df.columns) or 1)
+        
+        # FIX: Sanitize text to prevent PDF from crashing the server on weird symbols
+        def sanitize(text):
+            return str(text)[:20].encode('latin-1', 'replace').decode('latin-1')
+            
         for col in df.columns:
-            pdf.cell(col_width, 10, str(col)[:15], border=1)
+            pdf.cell(col_width, 10, sanitize(col), border=1)
         pdf.ln()
         for _, row in df.iterrows():
             for item in row:
-                pdf.cell(col_width, 10, str(item)[:15], border=1)
+                pdf.cell(col_width, 10, sanitize(item), border=1)
             pdf.ln()
         pdf_bytes = pdf.output(dest='S').encode('latin1')
         output.write(pdf_bytes)
@@ -169,12 +185,21 @@ def export_data():
         filename = 'Cleaned_Data.pdf'
         
     elif format_type == 'image':
-        fig, ax = plt.subplots(figsize=(max(8, len(df.columns)*1.5), max(4, len(df)*0.5)))
+        # FIX: Dynamic High-Res Image Sizing
+        cols = len(df.columns)
+        rows = len(df) + 1
+        fig, ax = plt.subplots(figsize=(max(10, cols * 2), max(5, rows * 0.6)))
         ax.axis('tight')
         ax.axis('off')
-        ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='center')
-        plt.savefig(output, format='png', bbox_inches='tight', dpi=300)
-        plt.close(fig)
+        
+        table = ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(12)
+        table.scale(1, 2) # Adds padding to rows so text isn't blurry or cramped
+        
+        plt.savefig(output, format='png', bbox_inches='tight', dpi=400) # Upgraded to 400 DPI
+        plt.close('all') # CRITICAL: Frees server memory so it doesn't crash on the next download
+        
         mimetype = 'image/png'
         filename = 'Cleaned_Data.png'
 
@@ -183,7 +208,6 @@ def export_data():
 
 @app.route('/append_export', methods=['POST'])
 def append_export():
-    """ Appends data to an existing uploaded Excel or CSV file """
     if 'existing_file' not in request.files:
         return jsonify({'error': 'No existing file provided'})
         
